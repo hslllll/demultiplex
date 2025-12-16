@@ -13,3 +13,4 @@ csv = "*"
 flate2 = "*"
 anyhow = "*"
 num_cpus = "*"
+block-aligner = { version = "0.5", default-features = false, features = ["simd_avx2"] }
