@@ -174,18 +174,19 @@ fn merge_reads(r1: &[u8], r2: &[u8], min_overlap: usize, max_mismatch: usize) ->
     None 
 }
 
-fn best_alignment_dual<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, bool, f64, String) {
+// 반환값 변경: String -> bool (is_reverse_complement)
+fn best_alignment_dual<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, bool, f64, bool) {
     if genes.is_empty() {
-        return ("Unknown", false, f64::NEG_INFINITY, String::from_utf8_lossy(seq).to_string());
+        return ("Unknown", false, f64::NEG_INFINITY, false);
     }
     let (id_f, score_f) = align_to_genes(genes, seq);
     let seq_rc = revcomp(seq);
     let (id_r, score_r) = align_to_genes(genes, &seq_rc);
 
     if score_f >= score_r {
-        (id_f, false, score_f, String::from_utf8_lossy(seq).to_string())
+        (id_f, false, score_f, false) // false = Forward
     } else {
-        (id_r, false, score_r, String::from_utf8_lossy(&seq_rc).to_string())
+        (id_r, false, score_r, true)  // true = Reverse Complement
     }
 }
 
@@ -247,6 +248,7 @@ fn main() -> Result<()> {
             let merged = merge_reads(r1, r2, 10, 3)?; 
             merged_success.fetch_add(1, Ordering::Relaxed);
 
+            // 1. Trimming (WT 판별 및 Alignment용)
             let mut trimmed = merged.clone();
             let start_trim = match orientation {
                 ReadOrientation::R1FwdR2Rev => sample.primer_a_len,
@@ -263,21 +265,31 @@ fn main() -> Result<()> {
                 return None; 
             }
 
-            let (gene_id, _, _score, oriented_seq) = best_alignment_dual(&genes, &trimmed);
+            // 2. Alignment (ID 찾기 및 방향 확인)
+            // is_rc: 이 Read가 Gene 기준 역방향인지 확인
+            let (gene_id, _, _score, is_rc) = best_alignment_dual(&genes, &trimmed);
             
+            // 3. WT 판별 (Trimmed Sequence 기준)
             let wt_seq_str = gene_map.get(gene_id).unwrap();
-            let seq_upper = oriented_seq.to_ascii_uppercase();
             let wt_upper = wt_seq_str.to_ascii_uppercase();
 
-            let is_contained = wt_upper.contains(&seq_upper) || seq_upper.contains(&wt_upper);
+            // 판별을 위해 trimmed 서열도 방향을 맞춤
+            let trimmed_oriented = if is_rc { revcomp(&trimmed) } else { trimmed.clone() };
+            let trimmed_str = String::from_utf8_lossy(&trimmed_oriented).to_ascii_uppercase();
+
+            let is_contained = wt_upper.contains(&trimmed_str) || trimmed_str.contains(&wt_upper);
             let final_wt_check = is_contained; 
             
             let type_str = if final_wt_check { "WT" } else { "Mutant" };
             
+            // 4. 최종 Output 서열 결정
+            // WT -> 깔끔한 Reference 서열
+            // Mutant -> 프라이머가 포함된 'Merged Full Sequence' (단, 유전자 방향에 맞게 정렬)
             let final_seq = if final_wt_check { 
                 wt_seq_str.clone()
             } else { 
-                oriented_seq.clone() 
+                let merged_oriented = if is_rc { revcomp(&merged) } else { merged.clone() };
+                String::from_utf8_lossy(&merged_oriented).to_string()
             };
 
             Some(((sample.id.clone(), gene_id.to_string(), final_seq), (type_str.to_string(), 1u64)))
