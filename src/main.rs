@@ -118,7 +118,7 @@ fn matches_start(read: &[u8], primer: &[u8], max_mismatch: usize) -> bool {
 }
 
 fn detect_sample<'a>(samples: &'a [SampleRecord], r1: &[u8], r2: &[u8]) -> Option<(&'a SampleRecord, ReadOrientation)> {
-    const MAX_MM: usize = 2; 
+    const MAX_MM: usize = 3; 
     for s in samples {
         if matches_start(r1, &s.primer_a_anchor, MAX_MM) && matches_start(r2, &s.primer_b_anchor, MAX_MM) {
             return Some((s, ReadOrientation::R1FwdR2Rev));
@@ -160,7 +160,7 @@ fn calculate_similarity_bytes(seq1: &[u8], seq2: &[u8]) -> f64 {
 }
 
 fn separate_gene_read(sequence: &[u8], genes: &[GeneRecord]) -> Option<(String, Vec<u8>)> {
-    const SIMILARITY_THRESHOLD: f64 = 0.8; 
+    const SIMILARITY_THRESHOLD: f64 = 0.7; 
 
     let mut best_gene_id: Option<&str> = None;
     let mut best_similarity: f64 = -1.0;
