@@ -338,12 +338,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let mut sample_stats: HashMap<(String, String), (u32, u32, u32)> = HashMap::new();
+    let mut unidentified_count = 0;
+
+    for ((sample_id, gene, variant_type, _), count) in &results_map {
+        if sample_id == "Unidentified" {
+            unidentified_count += *count;
+            continue;
+        }
+        let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0));
+        if variant_type == "Wild Type" {
+            stats.0 += *count;
+        } else if variant_type == "Mutation" {
+            stats.1 += *count;
+        } else {
+            stats.2 += *count;
+        }
+    }
+
     let mut wtr = csv::Writer::from_path(&args.output)?;
     for ((sample_id, gene, variant_type, sequence), count) in results_map {
         wtr.serialize(OutputRow { sample_id, gene, variant_type, sequence, count })?;
     }
     wtr.flush()?;
     println!("Analysis complete. Summary saved to {}", args.output.display());
+
+    println!("\nSample Statistics:");
+    println!("Sample ID\tGene\tWild Type\tMutation\tOthers");
+    let mut sorted_keys: Vec<_> = sample_stats.keys().collect();
+    sorted_keys.sort();
+    
+    for key in sorted_keys {
+        let (wt, mutation, others) = sample_stats.get(key).unwrap();
+        println!("{}\t{}\t{}\t{}\t{}", key.0, key.1, wt, mutation, others);
+    }
+    if unidentified_count > 0 {
+        println!("Unidentified\tN/A\t0\t0\t{}", unidentified_count);
+    }
 
     Ok(())
 }
