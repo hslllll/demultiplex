@@ -10,7 +10,6 @@ use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
 use rayon::prelude::*;
 use bio::alphabets::dna::revcomp;
 use bio::alignment::pairwise::Aligner;
-use bio::alignment::AlignmentOperation;
 use block_aligner::scan_block::{Block, PaddedBytes};
 use block_aligner::scores::{Gaps, NucMatrix};
 
@@ -259,16 +258,14 @@ fn align_to_genes<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64) {
 
 fn is_wild_type(read: &[u8], wt: &[u8]) -> bool {
     let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
-    let mut aligner = Aligner::with_capacity(read.len(), wt.len(), -5, -1, &score);
-    let alignment = aligner.custom(read, wt);
+    // Pattern: wt, Text: read
+    // Semiglobal: pattern must align fully to a substring of text.
+    // This allows read to have extra bases at start/end (e.g. extra primer parts or adapters if not fully trimmed, or the 'TC' overhang).
+    let mut aligner = Aligner::with_capacity(wt.len(), read.len(), -5, -1, &score);
+    let alignment = aligner.semiglobal(wt, read);
     
-    for op in alignment.operations {
-        match op {
-            AlignmentOperation::Subst | AlignmentOperation::Ins | AlignmentOperation::Del => return false,
-            _ => {}
-        }
-    }
-    true
+    // Check if score is perfect (length of wt * match score)
+    alignment.score == (wt.len() as i32) * 2
 }
 
 #[derive(Serialize)]
@@ -339,6 +336,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string().to_ascii_uppercase();
                             let is_wt = is_wild_type(final_gene_seq.as_bytes(), wt_sequence_str.as_bytes());
                             let variant_type = if is_wt { "Wild Type" } else { "Mutation" };
+
+                            if args.debug && variant_type == "Mutation" && sample_record.id == "2" {
+                                use std::sync::atomic::{AtomicUsize, Ordering};
+                                static DEBUG_COUNT: AtomicUsize = AtomicUsize::new(0);
+                                if DEBUG_COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
+                                    eprintln!("\n[DEBUG] Sample 2 Mutation Analysis:");
+                                    eprintln!("Read: {}", final_gene_seq);
+                                    eprintln!("WT:   {}", wt_sequence_str);
+                                    let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
+                                    let mut aligner = Aligner::with_capacity(wt_sequence_str.len(), final_gene_seq.len(), -5, -1, &score);
+                                    let alignment = aligner.semiglobal(wt_sequence_str.as_bytes(), final_gene_seq.as_bytes());
+                                    eprintln!("Score: {} / {}", alignment.score, wt_sequence_str.len() * 2);
+                                    eprintln!("Ops: {:?}", alignment.operations);
+                                }
+                            }
+
                             *local_results_map.entry((sample_record.id.clone(), gene_id.to_string(), variant_type.to_string(), final_gene_seq)).or_insert(0) += 1;
                         } else {
                             *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
@@ -374,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0));
-        if variant_type == "WildType" {
+        if variant_type == "Wild Type" {
             stats.0 += *count;
         } else if variant_type == "Mutation" {
             stats.1 += *count;
@@ -391,7 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Analysis complete. Summary saved to {}", args.output.display());
 
     println!("\nSample Statistics:");
-    println!("Sample ID\tGene\tWildType\tMutation\tOthers");
+    println!("Sample ID\tGene\tWild Type\tMutation\tOthers");
     let mut sorted_keys: Vec<_> = sample_stats.keys().collect();
     sorted_keys.sort();
     
