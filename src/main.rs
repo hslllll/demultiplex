@@ -139,46 +139,59 @@ fn align_primer<'a>(read: &'a [u8], primer: &'a [u8]) -> Option<(i32, usize, usi
 
 fn detect_sample_with_alignment<'a>(samples: &'a [SampleRecord], r1: &'a [u8], r2: &'a [u8], debug: bool) -> Option<(&'a SampleRecord, ReadOrientation, usize, usize)> {
     const MIN_NORMALIZED_SCORE: f64 = 0.6;
+    let mut best_match: Option<(&'a SampleRecord, ReadOrientation, usize, usize, i32)> = None;
 
     for s in samples {
         // R1-Fwd, R2-Fwd
         if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_a), align_primer(r2, &s.primer_b)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_a.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_b.len() as f64);
+            let total_score = score1 + score2;
             if debug { eprintln!("Sample: {}, R1Fwd/R2Fwd scores: {:.2} ({}), {:.2} ({})", s.id, norm_score1, score1, norm_score2, score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1FwdR2Rev, start1, start2));
+                if best_match.is_none() || total_score > best_match.unwrap().4 {
+                    best_match = Some((s, ReadOrientation::R1FwdR2Rev, start1, start2, total_score));
+                }
             }
         }
         // R1-Rev, R2-Rev
         if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_b), align_primer(r2, &s.primer_a)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_b.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_a.len() as f64);
+            let total_score = score1 + score2;
             if debug { eprintln!("Sample: {}, R1Rev/R2Rev scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1RevR2Fwd, start1, start2));
+                if best_match.is_none() || total_score > best_match.unwrap().4 {
+                    best_match = Some((s, ReadOrientation::R1RevR2Fwd, start1, start2, total_score));
+                }
             }
         }
         // R1-Fwd-RC, R2-Fwd-RC
         if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_a_rc), align_primer(r2, &s.primer_b_rc)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_a_rc.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_b_rc.len() as f64);
+            let total_score = score1 + score2;
             if debug { eprintln!("Sample: {}, R1FwdRC/R2FwdRC scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1FwdR2Rev, start1, start2));
+                if best_match.is_none() || total_score > best_match.unwrap().4 {
+                    best_match = Some((s, ReadOrientation::R1FwdR2Rev, start1, start2, total_score));
+                }
             }
         }
         // R1-Rev-RC, R2-Rev-RC
         if let (Some((score1, start1, _)), Some((score2, start2, _))) = (align_primer(r1, &s.primer_b_rc), align_primer(r2, &s.primer_a_rc)) {
             let norm_score1 = score1 as f64 / (2.0 * s.primer_b_rc.len() as f64);
             let norm_score2 = score2 as f64 / (2.0 * s.primer_a_rc.len() as f64);
+            let total_score = score1 + score2;
             if debug { eprintln!("Sample: {}, R1RevRC/R2RevRC scores: {:.2}, {:.2}", s.id, norm_score1, norm_score2); }
             if norm_score1 >= MIN_NORMALIZED_SCORE && norm_score2 >= MIN_NORMALIZED_SCORE {
-                return Some((s, ReadOrientation::R1RevR2Fwd, start1, start2));
+                if best_match.is_none() || total_score > best_match.unwrap().4 {
+                    best_match = Some((s, ReadOrientation::R1RevR2Fwd, start1, start2, total_score));
+                }
             }
         }
     }
-    None
+    best_match.map(|(s, o, start1, start2, _)| (s, o, start1, start2))
 }
 
 fn merge_reads(r1: &[u8], r2: &[u8], min_overlap: usize, max_mismatch: usize) -> Option<Vec<u8>> {
