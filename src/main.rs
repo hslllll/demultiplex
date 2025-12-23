@@ -10,6 +10,7 @@ use seq_io::fastq::{Reader as FastqReader, Record as FastqRecord};
 use rayon::prelude::*;
 use bio::alphabets::dna::revcomp;
 use bio::alignment::pairwise::Aligner;
+use bio::alignment::AlignmentOperation;
 use block_aligner::scan_block::{Block, PaddedBytes};
 use block_aligner::scores::{Gaps, NucMatrix};
 
@@ -256,6 +257,20 @@ fn align_to_genes<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64) {
     (best_id, best_norm)
 }
 
+fn is_wild_type(read: &[u8], wt: &[u8]) -> bool {
+    let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
+    let mut aligner = Aligner::with_capacity(read.len(), wt.len(), -5, -1, &score);
+    let alignment = aligner.custom(read, wt);
+    
+    for op in alignment.operations {
+        match op {
+            AlignmentOperation::Subst | AlignmentOperation::Ins | AlignmentOperation::Del => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 #[derive(Serialize)]
 struct OutputRow {
     #[serde(rename = "Sample_ID")]
@@ -322,7 +337,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let wt_sequence_str = gene_map.get(gene_id).unwrap();
                             let final_gene_seq_bytes = if is_rc { revcomp(trimmed_seq) } else { trimmed_seq.to_vec() };
                             let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string().to_ascii_uppercase();
-                            let variant_type = if final_gene_seq == *wt_sequence_str { "WildType" } else { "Mutation" };
+                            let is_wt = is_wild_type(final_gene_seq.as_bytes(), wt_sequence_str.as_bytes());
+                            let variant_type = if is_wt { "Wild Type" } else { "Mutation" };
                             *local_results_map.entry((sample_record.id.clone(), gene_id.to_string(), variant_type.to_string(), final_gene_seq)).or_insert(0) += 1;
                         } else {
                             *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
