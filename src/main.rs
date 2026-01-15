@@ -27,6 +27,8 @@ struct Args {
     genes: PathBuf,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long, default_value_t = 3)]
+    mutation_threshold: u32,
     #[arg(long, default_value_t = false)]
     debug: bool,
 }
@@ -378,10 +380,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Collapse rare mutation types (per sample + gene + sequence) below the threshold into "Others".
+    let mut folded_results: HashMap<(String, String, String, String), u32> = HashMap::new();
+    for ((sample_id, gene, variant_type, sequence), count) in results_map {
+        if variant_type == "Mutation" && count < args.mutation_threshold {
+            let key = (sample_id, gene, "Others".to_string(), "Others".to_string());
+            *folded_results.entry(key).or_insert(0) += count;
+        } else {
+            *folded_results.entry((sample_id, gene, variant_type, sequence)).or_insert(0) += count;
+        }
+    }
+
     let mut sample_stats: HashMap<(String, String), (u32, u32, u32)> = HashMap::new();
     let mut unidentified_count = 0;
 
-    for ((sample_id, gene, variant_type, _), count) in &results_map {
+    for ((sample_id, gene, variant_type, _), count) in &folded_results {
         if sample_id == "Unidentified" {
             unidentified_count += *count;
             continue;
@@ -397,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut wtr = csv::Writer::from_path(&args.output)?;
-    for ((sample_id, gene, variant_type, sequence), count) in results_map {
+    for ((sample_id, gene, variant_type, sequence), count) in folded_results {
         wtr.serialize(OutputRow { sample_id, gene, variant_type, sequence, count })?;
     }
     wtr.flush()?;
