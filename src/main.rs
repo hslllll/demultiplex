@@ -439,14 +439,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             *local_results_map.entry((sample_record.id.clone(), gene_id.to_string(), variant_type.to_string(), final_gene_seq)).or_insert(0) += 1;
                         } else {
-                            *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
+                            *local_results_map.entry((sample_record.id.clone(), "Others".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
                         }
                     }
                 } else {
-                    *local_results_map.entry((sample_record.id.clone(), "N/A".to_string(), "Unmerged".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
+                    *local_results_map.entry((sample_record.id.clone(), "Others".to_string(), "Unmerged".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
                 }
             } else {
-                *local_results_map.entry(("Unidentified".to_string(), "N/A".to_string(), "N/A".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
+                *local_results_map.entry(("Unidentified".to_string(), "Others".to_string(), "Others".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
             }
             local_results_map
         }).collect();
@@ -513,7 +513,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}\t{}\t{}\t{}\t{}\t{}", key.0, key.1, wt, mutation, seq_error, others);
     }
     if unidentified_count > 0 {
-        println!("Unidentified\tN/A\t0\t0\t0\t{}", unidentified_count);
+        println!("Unidentified\tOthers\t0\t0\t0\t{}", unidentified_count);
     }
 
     Ok(())
