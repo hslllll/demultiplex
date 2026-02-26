@@ -69,17 +69,16 @@ fn read_genes(path: &PathBuf, grna_buffer: usize) -> Result<Vec<GeneRecord>> {
             "gRNA sequence '{}' not found in WT sequence for gene {}", grna, id
         ))?;
         
-        // gRNA ends with PAM (NGG, 3bp). Cut site is 3bp before PAM.
-        // cut_site = gRNA_pos + gRNA_len - 6 (3bp PAM + 3bp upstream)
+        // gRNA ends with PAM (NGG, last 3 bases). The N of PAM is at grna_pos + grna_len - 3.
+        // Mutation window: N_of_PAM ± buffer (clamped to WT bounds)
         let grna_len = grna.len();
-        let cut_site = grna_pos + grna_len.saturating_sub(6);
+        let pam_n_pos = grna_pos + grna_len.saturating_sub(3);
         
-        // Mutation window: cut_site ± buffer (clamped to WT bounds)
-        let grna_start = cut_site.saturating_sub(grna_buffer);
-        let grna_end = (cut_site + grna_buffer + 1).min(seq.len()); // +1 to include cut_site itself
+        let grna_start = pam_n_pos.saturating_sub(grna_buffer);
+        let grna_end = (pam_n_pos + grna_buffer + 1).min(seq.len());
         
-        eprintln!("Gene {}: gRNA at {}-{}, cut site: {}, mutation window: {}-{}", 
-            id, grna_pos, grna_pos + grna_len, cut_site, grna_start, grna_end);
+        eprintln!("Gene {}: gRNA at {}-{}, PAM N at {}, mutation window: {}-{}", 
+            id, grna_pos, grna_pos + grna_len, pam_n_pos, grna_start, grna_end);
         
         genes.push(GeneRecord { id, wt: seq, grna_start, grna_end });
     }
@@ -236,6 +235,10 @@ fn merge_reads(r1: &[u8], r2: &[u8], min_overlap: usize, max_mismatch: usize) ->
     None 
 }
 
+// Minimum normalised alignment score to assign a read to a gene.
+// Reads that score below this are classified as "Unknown" → Others.
+const MIN_GENE_NORM_SCORE: f64 = 0.3;
+
 fn best_alignment_dual<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64, bool) {
     if genes.is_empty() {
         return ("Unknown", f64::NEG_INFINITY, false);
@@ -244,10 +247,16 @@ fn best_alignment_dual<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64
     let seq_rc = revcomp(seq);
     let (id_r, score_r) = align_to_genes(genes, &seq_rc);
 
-    if score_f >= score_r {
+    let (best_id, best_score, is_rc) = if score_f >= score_r {
         (id_f, score_f, false)
     } else {
         (id_r, score_r, true)
+    };
+
+    if best_score < MIN_GENE_NORM_SCORE {
+        ("Unknown", best_score, is_rc)
+    } else {
+        (best_id, best_score, is_rc)
     }
 }
 
@@ -405,16 +414,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let chunk_results: Vec<HashMap<_, _>> = chunk.par_iter().map(|(r1_seq, r2_seq)| {
             let mut local_results_map = HashMap::new();
-            if let Some((sample_record, _orientation, start_trim, end_trim)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
-                if let Some(merged_seq) = merge_reads(r1_seq, r2_seq, 10, 5) {
+            // Step 1: Merge paired-end reads. Failure → Others/Unmerged.
+            if let Some(merged_seq) = merge_reads(r1_seq, r2_seq, 10, 5) {
+                // Step 2: Identify sample by primer. Failure → Others/Unidentified Sample.
+                if let Some((sample_record, _orientation, start_trim, end_trim)) = detect_sample_with_alignment(&samples, r1_seq, r2_seq, args.debug) {
                     if merged_seq.len() > start_trim + end_trim {
                         let trimmed_seq = &merged_seq[start_trim..merged_seq.len() - end_trim];
+                        // Step 3: Assign to paralog gene. Failure → Others/Unassigned Gene.
                         let (gene_id, _score, is_rc) = best_alignment_dual(&genes, trimmed_seq);
                         if gene_id != "Unknown" {
                             let (wt_sequence_str, window_start, window_end) = gene_map.get(gene_id).unwrap();
                             let final_gene_seq_bytes = if is_rc { revcomp(trimmed_seq) } else { trimmed_seq.to_vec() };
                             let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string().to_ascii_uppercase();
                             
+                            // Step 4: Classify variant relative to gRNA PAM-N window.
                             let mutation_class = classify_mutation(
                                 final_gene_seq.as_bytes(),
                                 wt_sequence_str.as_bytes(),
@@ -445,14 +458,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             *local_results_map.entry((sample_record.id.clone(), gene_id.to_string(), variant_type.to_string(), final_gene_seq)).or_insert(0) += 1;
                         } else {
-                            *local_results_map.entry((sample_record.id.clone(), "Others".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
+                            // Gene not assigned
+                            *local_results_map.entry((sample_record.id.clone(), "Others".to_string(), "Unassigned Gene".to_string(), String::from_utf8_lossy(trimmed_seq).to_string())).or_insert(0) += 1;
                         }
                     }
                 } else {
-                    *local_results_map.entry((sample_record.id.clone(), "Others".to_string(), "Unmerged".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
+                    // Sample not identified
+                    *local_results_map.entry(("Others".to_string(), "Others".to_string(), "Unidentified Sample".to_string(), String::from_utf8_lossy(&merged_seq).to_string())).or_insert(0) += 1;
                 }
             } else {
-                *local_results_map.entry(("Unidentified".to_string(), "Others".to_string(), "Others".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
+                // Merge failed
+                *local_results_map.entry(("Others".to_string(), "Others".to_string(), "Unmerged".to_string(), format!("R1:{} R2:{}", String::from_utf8_lossy(r1_seq), String::from_utf8_lossy(r2_seq)))).or_insert(0) += 1;
             }
             local_results_map
         }).collect();
@@ -469,12 +485,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Collapse rare mutation types (per sample + gene + sequence) below the threshold into "Others".
-    // Also fold rare Sequencing Errors into "Others".
+    // Step 5: Rare mutations (count ≤ mutation_threshold) are re-classified as Sequencing Errors.
+    // Sequencing Errors (outside gRNA window) are kept as-is regardless of count.
     let mut folded_results: HashMap<(String, String, String, String), u32> = HashMap::new();
     for ((sample_id, gene, variant_type, sequence), count) in results_map {
-        if (variant_type == "Mutation" || variant_type == "Sequencing Error") && count < args.mutation_threshold {
-            let key = (sample_id, gene, "Others".to_string(), "Others".to_string());
+        if variant_type == "Mutation" && count <= args.mutation_threshold {
+            // Re-classify infrequent mutations as Sequencing Error
+            let key = (sample_id, gene, "Sequencing Error".to_string(), sequence);
             *folded_results.entry(key).or_insert(0) += count;
         } else {
             *folded_results.entry((sample_id, gene, variant_type, sequence)).or_insert(0) += count;
@@ -483,11 +500,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stats: (wt, mutation, seq_error, others)
     let mut sample_stats: HashMap<(String, String), (u32, u32, u32, u32)> = HashMap::new();
-    let mut unidentified_count = 0;
+    let mut others_count = 0; // reads that could not be assigned to a real sample
 
     for ((sample_id, gene, variant_type, _), count) in &folded_results {
-        if sample_id == "Unidentified" {
-            unidentified_count += *count;
+        if sample_id == "Others" {
+            others_count += *count;
             continue;
         }
         let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0, 0));
@@ -518,8 +535,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (wt, mutation, seq_error, others) = sample_stats.get(key).unwrap();
         println!("{}\t{}\t{}\t{}\t{}\t{}", key.0, key.1, wt, mutation, seq_error, others);
     }
-    if unidentified_count > 0 {
-        println!("Unidentified\tOthers\t0\t0\t0\t{}", unidentified_count);
+    if others_count > 0 {
+        println!("Others\tOthers\t0\t0\t0\t{}", others_count);
     }
 
     Ok(())
