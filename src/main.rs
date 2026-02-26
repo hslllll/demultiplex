@@ -27,7 +27,7 @@ struct Args {
     genes: PathBuf,
     #[arg(long)]
     output: PathBuf,
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 100)]
     mutation_threshold: u32,
     #[arg(long, default_value_t = 5)]
     grna_buffer: usize,
