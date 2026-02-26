@@ -69,11 +69,17 @@ fn read_genes(path: &PathBuf, grna_buffer: usize) -> Result<Vec<GeneRecord>> {
             "gRNA sequence '{}' not found in WT sequence for gene {}", grna, id
         ))?;
         
-        // Calculate mutation window with buffer (clamped to WT bounds)
-        let grna_start = grna_pos.saturating_sub(grna_buffer);
-        let grna_end = (grna_pos + grna.len() + grna_buffer).min(seq.len());
+        // gRNA ends with PAM (NGG, 3bp). Cut site is 3bp before PAM.
+        // cut_site = gRNA_pos + gRNA_len - 6 (3bp PAM + 3bp upstream)
+        let grna_len = grna.len();
+        let cut_site = grna_pos + grna_len.saturating_sub(6);
         
-        eprintln!("Gene {}: gRNA at {}-{}, mutation window: {}-{}", id, grna_pos, grna_pos + grna.len(), grna_start, grna_end);
+        // Mutation window: cut_site ± buffer (clamped to WT bounds)
+        let grna_start = cut_site.saturating_sub(grna_buffer);
+        let grna_end = (cut_site + grna_buffer + 1).min(seq.len()); // +1 to include cut_site itself
+        
+        eprintln!("Gene {}: gRNA at {}-{}, cut site: {}, mutation window: {}-{}", 
+            id, grna_pos, grna_pos + grna_len, cut_site, grna_start, grna_end);
         
         genes.push(GeneRecord { id, wt: seq, grna_start, grna_end });
     }
