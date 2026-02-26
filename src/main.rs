@@ -29,6 +29,8 @@ struct Args {
     output: PathBuf,
     #[arg(long, default_value_t = 3)]
     mutation_threshold: u32,
+    #[arg(long, default_value_t = 5)]
+    grna_buffer: usize,
     #[arg(long, default_value_t = false)]
     debug: bool,
 }
@@ -46,9 +48,11 @@ struct SampleRecord {
 struct GeneRecord {
     id: String,
     wt: String,
+    grna_start: usize,
+    grna_end: usize,
 }
 
-fn read_genes(path: &PathBuf) -> Result<Vec<GeneRecord>> {
+fn read_genes(path: &PathBuf, grna_buffer: usize) -> Result<Vec<GeneRecord>> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -58,7 +62,20 @@ fn read_genes(path: &PathBuf) -> Result<Vec<GeneRecord>> {
         let rec = rec?;
         let id = rec.get(0).ok_or_else(|| anyhow!("Gene_ID missing"))?.to_string();
         let seq = rec.get(1).ok_or_else(|| anyhow!("WT_Sequence missing"))?.to_ascii_uppercase();
-        genes.push(GeneRecord { id, wt: seq });
+        let grna = rec.get(2).ok_or_else(|| anyhow!("gRNA_Sequence missing for gene {}", id))?.to_ascii_uppercase();
+        
+        // Find gRNA position in WT sequence
+        let grna_pos = seq.find(&grna).ok_or_else(|| anyhow!(
+            "gRNA sequence '{}' not found in WT sequence for gene {}", grna, id
+        ))?;
+        
+        // Calculate mutation window with buffer (clamped to WT bounds)
+        let grna_start = grna_pos.saturating_sub(grna_buffer);
+        let grna_end = (grna_pos + grna.len() + grna_buffer).min(seq.len());
+        
+        eprintln!("Gene {}: gRNA at {}-{}, mutation window: {}-{}", id, grna_pos, grna_pos + grna.len(), grna_start, grna_end);
+        
+        genes.push(GeneRecord { id, wt: seq, grna_start, grna_end });
     }
     Ok(genes)
 }
@@ -258,16 +275,68 @@ fn align_to_genes<'a>(genes: &'a [GeneRecord], seq: &[u8]) -> (&'a str, f64) {
     (best_id, best_norm)
 }
 
-fn is_wild_type(read: &[u8], wt: &[u8]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MutationClass {
+    WildType,
+    Mutation,        // On-target mutation within gRNA window
+    SequencingError, // Off-target mutation outside gRNA window
+}
+
+fn classify_mutation(read: &[u8], wt: &[u8], window_start: usize, window_end: usize) -> MutationClass {
+    use bio::alignment::AlignmentOperation;
+    
     let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
-    // Pattern: wt, Text: read
-    // Semiglobal: pattern must align fully to a substring of text.
-    // This allows read to have extra bases at start/end (e.g. extra primer parts or adapters if not fully trimmed, or the 'TC' overhang).
     let mut aligner = Aligner::with_capacity(wt.len(), read.len(), -5, -1, &score);
     let alignment = aligner.semiglobal(wt, read);
     
-    // Check if score is perfect (length of wt * match score)
-    alignment.score == (wt.len() as i32) * 2
+    // Perfect match = Wild Type
+    if alignment.score == (wt.len() as i32) * 2 {
+        return MutationClass::WildType;
+    }
+    
+    // Track mutation positions in WT coordinate space
+    let mut wt_pos = alignment.xstart; // Position in WT (pattern)
+    let mut has_mutation_in_window = false;
+    
+    for op in &alignment.operations {
+        match op {
+            AlignmentOperation::Match | AlignmentOperation::Subst => {
+                if *op == AlignmentOperation::Subst {
+                    // Substitution at wt_pos
+                    if wt_pos >= window_start && wt_pos < window_end {
+                        has_mutation_in_window = true;
+                    }
+                }
+                wt_pos += 1;
+            }
+            AlignmentOperation::Del => {
+                // Deletion in read (gap in read, present in WT)
+                if wt_pos >= window_start && wt_pos < window_end {
+                    has_mutation_in_window = true;
+                }
+                wt_pos += 1;
+            }
+            AlignmentOperation::Ins => {
+                // Insertion in read (gap in WT)
+                // Insertion affects the position right before wt_pos
+                if wt_pos > 0 && (wt_pos - 1) >= window_start && (wt_pos - 1) < window_end {
+                    has_mutation_in_window = true;
+                } else if wt_pos >= window_start && wt_pos < window_end {
+                    has_mutation_in_window = true;
+                }
+                // wt_pos doesn't change for insertions
+            }
+            AlignmentOperation::Xclip(_) | AlignmentOperation::Yclip(_) => {
+                // Clipping operations - typically at ends, consider as outside window
+            }
+        }
+    }
+    
+    if has_mutation_in_window {
+        MutationClass::Mutation
+    } else {
+        MutationClass::SequencingError
+    }
 }
 
 #[derive(Serialize)]
@@ -309,8 +378,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rayon::ThreadPoolBuilder::new().num_threads(num_cpus::get()).build_global()?;
 
     let samples = read_samples(&args.samples).context("Failed to read samples file")?;
-    let genes = read_genes(&args.genes).context("Failed to read genes file")?;
-    let gene_map: HashMap<String, String> = genes.iter().map(|g| (g.id.clone(), g.wt.clone())).collect();
+    let genes = read_genes(&args.genes, args.grna_buffer).context("Failed to read genes file")?;
+    // gene_map: gene_id -> (wt_sequence, grna_window_start, grna_window_end)
+    let gene_map: HashMap<String, (String, usize, usize)> = genes.iter()
+        .map(|g| (g.id.clone(), (g.wt.clone(), g.grna_start, g.grna_end)))
+        .collect();
 
     let r1_file = File::open(&args.r1)?;
     let r2_file = File::open(&args.r2)?;
@@ -333,19 +405,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let trimmed_seq = &merged_seq[start_trim..merged_seq.len() - end_trim];
                         let (gene_id, _score, is_rc) = best_alignment_dual(&genes, trimmed_seq);
                         if gene_id != "Unknown" {
-                            let wt_sequence_str = gene_map.get(gene_id).unwrap();
+                            let (wt_sequence_str, window_start, window_end) = gene_map.get(gene_id).unwrap();
                             let final_gene_seq_bytes = if is_rc { revcomp(trimmed_seq) } else { trimmed_seq.to_vec() };
                             let final_gene_seq = String::from_utf8_lossy(&final_gene_seq_bytes).to_string().to_ascii_uppercase();
-                            let is_wt = is_wild_type(final_gene_seq.as_bytes(), wt_sequence_str.as_bytes());
-                            let variant_type = if is_wt { "Wild Type" } else { "Mutation" };
+                            
+                            let mutation_class = classify_mutation(
+                                final_gene_seq.as_bytes(),
+                                wt_sequence_str.as_bytes(),
+                                *window_start,
+                                *window_end
+                            );
+                            let variant_type = match mutation_class {
+                                MutationClass::WildType => "Wild Type",
+                                MutationClass::Mutation => "Mutation",
+                                MutationClass::SequencingError => "Sequencing Error",
+                            };
 
-                            if args.debug && variant_type == "Mutation" && sample_record.id == "2" {
+                            if args.debug && mutation_class != MutationClass::WildType && sample_record.id == "2" {
                                 use std::sync::atomic::{AtomicUsize, Ordering};
                                 static DEBUG_COUNT: AtomicUsize = AtomicUsize::new(0);
                                 if DEBUG_COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
-                                    eprintln!("\n[DEBUG] Sample 2 Mutation Analysis:");
+                                    eprintln!("\n[DEBUG] Sample 2 {} Analysis:", variant_type);
                                     eprintln!("Read: {}", final_gene_seq);
                                     eprintln!("WT:   {}", wt_sequence_str);
+                                    eprintln!("gRNA window: {}-{}", window_start, window_end);
                                     let score = |a: u8, b: u8| if a == b { 2i32 } else { -3i32 };
                                     let mut aligner = Aligner::with_capacity(wt_sequence_str.len(), final_gene_seq.len(), -5, -1, &score);
                                     let alignment = aligner.semiglobal(wt_sequence_str.as_bytes(), final_gene_seq.as_bytes());
@@ -381,9 +464,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Collapse rare mutation types (per sample + gene + sequence) below the threshold into "Others".
+    // Also fold rare Sequencing Errors into "Others".
     let mut folded_results: HashMap<(String, String, String, String), u32> = HashMap::new();
     for ((sample_id, gene, variant_type, sequence), count) in results_map {
-        if variant_type == "Mutation" && count < args.mutation_threshold {
+        if (variant_type == "Mutation" || variant_type == "Sequencing Error") && count < args.mutation_threshold {
             let key = (sample_id, gene, "Others".to_string(), "Others".to_string());
             *folded_results.entry(key).or_insert(0) += count;
         } else {
@@ -391,7 +475,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut sample_stats: HashMap<(String, String), (u32, u32, u32)> = HashMap::new();
+    // Stats: (wt, mutation, seq_error, others)
+    let mut sample_stats: HashMap<(String, String), (u32, u32, u32, u32)> = HashMap::new();
     let mut unidentified_count = 0;
 
     for ((sample_id, gene, variant_type, _), count) in &folded_results {
@@ -399,13 +484,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unidentified_count += *count;
             continue;
         }
-        let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0));
+        let stats = sample_stats.entry((sample_id.clone(), gene.clone())).or_insert((0, 0, 0, 0));
         if variant_type == "Wild Type" {
             stats.0 += *count;
         } else if variant_type == "Mutation" {
             stats.1 += *count;
-        } else {
+        } else if variant_type == "Sequencing Error" {
             stats.2 += *count;
+        } else {
+            stats.3 += *count;
         }
     }
 
@@ -417,16 +504,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Analysis complete. Summary saved to {}", args.output.display());
 
     println!("\nSample Statistics:");
-    println!("Sample ID\tGene\tWild Type\tMutation\tOthers");
+    println!("Sample ID\tGene\tWild Type\tMutation\tSeq Error\tOthers");
     let mut sorted_keys: Vec<_> = sample_stats.keys().collect();
     sorted_keys.sort();
     
     for key in sorted_keys {
-        let (wt, mutation, others) = sample_stats.get(key).unwrap();
-        println!("{}\t{}\t{}\t{}\t{}", key.0, key.1, wt, mutation, others);
+        let (wt, mutation, seq_error, others) = sample_stats.get(key).unwrap();
+        println!("{}\t{}\t{}\t{}\t{}\t{}", key.0, key.1, wt, mutation, seq_error, others);
     }
     if unidentified_count > 0 {
-        println!("Unidentified\tN/A\t0\t0\t{}", unidentified_count);
+        println!("Unidentified\tN/A\t0\t0\t0\t{}", unidentified_count);
     }
 
     Ok(())
